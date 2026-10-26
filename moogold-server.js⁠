@@ -18,8 +18,8 @@ app.get('/', (req, res) => {
 });
 
 async function callMooGoldApi(endpointPath, payloadObj, customPartnerId, customSecretKey) {
-  const PARTNER_ID = ab74f52a07f4ab3a2a6b5ac8e831a975 || process.env.MOOGOLD_PARTNER_ID;ab74f52a07f4ab3a2a6b5ac8e831a975
-  const SECRET_KEY = hejp7kWJ8y || process.env.MOOGOLD_SECRET_KEY;hejp7kWJ8y
+  const process.env.MOOGOLD_PARTNER_ID;ab74f52a07f4ab3a2a6b5ac8e831a975
+  const SECRET_KEY = hejp7kWJ8y
 
 
   if (!PARTNER_ID || !SECRET_KEY) {
