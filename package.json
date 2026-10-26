@@ -1,17 +1,13 @@
 {
-  "name": "moogold-backend-server",
-  "version": "1.0.0",
-  "description": "MooGold API Backend Server",
-  "main": "moogold-server.js",
   "scripts": {
     "start": "node moogold-server.js"
   },
   "dependencies": {
-    "adm-zip": "^0.5.10",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "helmet": "^7.1.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
     "multer": "^1.4.5-lts.1"
   }
 }
