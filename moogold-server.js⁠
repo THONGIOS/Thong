@@ -21,8 +21,9 @@ async function callMooGoldApi(endpointPath, payloadObj, customPartnerId, customS
   const PARTNER_ID = customPartnerId || process.env.MOOGOLD_PARTNER_ID;
   const SECRET_KEY = customSecretKey || process.env.MOOGOLD_SECRET_KEY;
 
+
   if (!PARTNER_ID || !SECRET_KEY) {
-    throw new Error("ab74f52a07f4ab3a2a6b5ac8e831,hejp7kWJ");
+    throw new Error("សូមដាក់ MOOGOLD_PARTNER_ID និង MOOGOLD_SECRET_KEY ឱ្យបានត្រឹមត្រូវ!");
   }
 
   const timestamp = Math.floor(Date.now() / 1000);
