@@ -1,128 +1,241 @@
-/**
- * ឯកសារ៖ moogold-server.js
- * តួនាទី៖ ភ្ជាប់ MooGold Official API (HMAC-SHA256) តាមស្តង់ដារ doc.moogold.com
- */
+// moogold-server.js
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const crypto = require('crypto');
 const multer = require('multer');
-const AdmZip = require('adm-zip');
-const fs = require('fs');
-const path = require('path');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
-app.use(helmet());
-app.use(cors());
-app.use(express.json({ limit: '25mb' }));
 
-app.get('/', (req, res) => {
-  res.json({ status: 'ONLINE', service: 'SOUYAKTHONG MooGold API Server Running 24/7' });
+app.disable('x-powered-by');
+app.use(helmet());
+
+// កំណត់ FRONTEND_ORIGIN ក្នុង .env ឱ្យត្រូវនឹង domain របស់ frontend
+const allowedOrigins = (process.env.FRONTEND_ORIGIN || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // អនុញ្ញាត request ដែលគ្មាន Origin ដូចជា server-to-server/health check
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error('Origin មិនត្រូវបានអនុញ្ញាត'));
+    },
+  })
+);
+
+app.use(express.json({ limit: '1mb' }));
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
 });
 
-// អនុគមន៍ហៅកាន់ MooGold API តាមស្តង់ដារ doc.moogold.com
-async function callMooGoldApi(endpointPath, payloadObj, customPartnerId, customSecretKey) {
-  const PARTNER_ID = customPartnerId || process.env.MOOGOLD_PARTNER_ID;ab74f52a07f4ab3a2a6b5ac8e831a975
-  const SECRET_KEY = customSecretKey || process.env.MOOGOLD_SECRET_KEY;hejp7kWJ8y
+app.use('/api/', apiLimiter);
 
-  if (!PARTNER_ID || !SECRET_KEY) {
-    throw new Error("process.env.MOOGOLD_PARTNER_ID;ab74f52a07f4ab3a2a6b5ac8e831a975 process.env.MOOGOLD_SECRET_KEY;hejp7kWJ8y");
+app.get('/', (_req, res) => {
+  res.json({ status: 'ONLINE', service: 'MooGold API server' });
+});
+
+// កុំទទួល Partner ID ឬ Secret Key ពី client។
+function getMooGoldCredentials() {
+  const partnerId = process.env.MOOGOLD_PARTNER_ID;ab74f52a07f4ab3a2a6b5ac8e831a975
+  const secretKey = process.env.MOOGOLD_SECRET_KEY;hejp7kWJ8y
+
+  if (!partnerId || !secretKey) {
+    throw new Error('MooGold credentials មិនទាន់បានកំណត់លើ server');
   }
 
-  const timestamp = Math.floor(Date.now() / 1000);
-  const payloadJson = JSON.stringify(payloadObj);
+  return { partnerId, secretKey };
+}
 
-  // រូបមន្ត HMAC-SHA256 Signature ផ្លូវការរបស់ MooGold
+// ការពារ routes ដោយ token របស់ server។
+function requireApiToken(req, res, next) {
+  const expected = process.env.API_ACCESS_TOKEN;
+  const provided = req.get('authorization') || '';
+  const prefix = 'Bearer ';
+
+  if (!expected || !provided.startsWith(prefix)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const actualBuffer = Buffer.from(provided.slice(prefix.length));
+  const expectedBuffer = Buffer.from(expected);
+
+  if (
+    actualBuffer.length !== expectedBuffer.length ||
+    !crypto.timingSafeEqual(actualBuffer, expectedBuffer)
+  ) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  next();
+}
+
+async function callMooGoldApi(endpointPath, payload) {
+  const { partnerId, secretKey } = getMooGoldCredentials();
+  const timestamp = Math.floor(Date.now() / 1000);
+  const payloadJson = JSON.stringify(payload);
+
+  // ផ្ទៀងផ្ទាត់រូបមន្ត signature និង payload ជាមួយឯកសារ MooGold បច្ចុប្បន្ន។
   const stringToSign = payloadJson + timestamp + endpointPath;
-  const authSignature = crypto
-    .createHmac('sha256', SECRET_KEY)
+  const signature = crypto
+    .createHmac('sha256', secretKey)
     .update(stringToSign)
     .digest('hex');
 
-  const basicAuth = Buffer.from(`${PARTNER_ID}:${SECRET_KEY}`).toString('base64');
+  const basicAuth = Buffer.from(`${partnerId}:${secretKey}`).toString('base64');
 
-  const response = await fetch(`https://moogold.com/wp-json/v1/api/${endpointPath}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'timestamp': String(timestamp),
-      'auth': authSignature,
-      'Authorization': `Basic ${basicAuth}`
-    },
-    body: payloadJson
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
 
-  const result = await response.json();
-  return result;
+  try {
+    const response = await fetch(
+      `https://moogold.com/wp-json/v1/api/${endpointPath}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          timestamp: String(timestamp),
+          auth: signature,
+          Authorization: `Basic ${basicAuth}`,
+        },
+        body: payloadJson,
+        signal: controller.signal,
+      }
+    );
+
+    const responseText = await response.text();
+    let result;
+
+    try {
+      result = responseText ? JSON.parse(responseText) : null;
+    } catch {
+      throw new Error('MooGold បានត្រឡប់មកនូវទិន្នន័យដែលមិនមែនជា JSON');
+    }
+
+    if (!response.ok) {
+      const error = new Error('MooGold API request failed');
+      error.statusCode = 502;
+      throw error;
+    }
+
+    return result;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-// 1. ឆែកទឹកប្រាក់ក្នុងគណនី (user/balance)
-app.post('/api/moogold/balance', async (req, res) => {
+app.post('/api/moogold/balance', requireApiToken, async (_req, res) => {
   try {
-    const { partnerId, secretKey } = req.body;
-    // តាម Doc MooGold: body ត្រូវមាន path: "user/balance"
-    const payload = { path: "user/balance" };
-    const data = await callMooGoldApi('user/balance', payload, partnerId, secretKey);
-    return res.json(data);
+    const payload = { path: 'user/balance' };
+    const result = await callMooGoldApi('user/balance', payload);
+    res.json(result);
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    console.error('MooGold balance error:', err);
+    res.status(err.statusCode || 500).json({
+      error: err.statusCode ? err.message : 'មិនអាចទាក់ទង MooGold បានទេ',
+    });
   }
 });
 
-// 2. បញ្ជាទិញទំនិញ/UC (order/create_order)
-app.post('/api/moogold/create-order', async (req, res) => {
+app.post('/api/moogold/create-order', requireApiToken, async (req, res) => {
   try {
-    const { partnerId, secretKey, variationId, playerId, serverId } = req.body;
-    if (!variationId || !playerId) {
-      return res.status(400).json({ error: "ខ្វះលេខ Variation ID ឬ Player ID!" });
+    const { variationId, playerId, serverId } = req.body || {};
+
+    if (
+      variationId === undefined ||
+      variationId === null ||
+      String(variationId).trim() === '' ||
+      playerId === undefined ||
+      playerId === null ||
+      String(playerId).trim() === ''
+    ) {
+      return res.status(400).json({
+        error: 'សូមបញ្ចូល variationId និង playerId ឱ្យបានត្រឹមត្រូវ',
+      });
     }
 
-    // តាម Doc MooGold សម្រាប់ការបង្កើត Order
     const orderData = {
       category: 1,
-      "product-id": String(variationId),
+      'product-id': String(variationId).trim(),
       quantity: 1,
-      "User ID": String(playerId)
+      'User ID': String(playerId).trim(),
     };
-    if (serverId) {
-      orderData["Server"] = String(serverId);
+
+    if (serverId !== undefined && String(serverId).trim() !== '') {
+      orderData.Server = String(serverId).trim();
     }
 
     const payload = {
-      path: "order/create_order",
-      data: orderData
+      path: 'order/create_order',
+      data: orderData,
     };
 
-    const result = await callMooGoldApi('order/create_order', payload, partnerId, secretKey);
-    return res.json({ success: true, moogoldResponse: result });
+    const result = await callMooGoldApi('order/create_order', payload);
+    res.json({ success: true, moogoldResponse: result });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    console.error('MooGold create-order error:', err);
+    res.status(err.statusCode || 500).json({
+      error: err.statusCode ? err.message : 'មិនអាចបង្កើត order បានទេ',
+    });
   }
 });
 
-// 3. ប្រព័ន្ធ Upload & Auto-Execute File
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-const upload = multer({ dest: uploadDir });
+// Upload ទុកជាឯកសារបណ្ដោះអាសន្នប៉ុណ្ណោះ។ មិនពន្លា ZIP និងមិន execute ឯកសារ។
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024, // អតិបរមា 5 MB
+    files: 1,
+  },
+});
 
-app.post('/api/upload-and-execute', upload.single('uploadedFile'), (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "មិនមាន File ទេ" });
-    const fileName = req.file.originalname;
-
-    if (fileName.endsWith('.zip')) {
-      const zip = new AdmZip(req.file.path);
-      const targetDir = path.join(__dirname, 'deployed_packages', Date.now().toString());
-      zip.extractAllTo(targetDir, true);
-      return res.json({ success: true, message: `បានពន្លា និងដំណើរការកញ្ចប់ ${fileName} ជោគជ័យ!` });
+app.post(
+  '/api/upload',
+  requireApiToken,
+  upload.single('uploadedFile'),
+  (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ error: 'មិនមានឯកសារទេ' });
     }
 
-    return res.json({ success: true, message: `បានរក្សាទុក និងដំណើរការ ${fileName} រួចរាល់!` });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
+    // មិនរក្សាឯកសារនៅលើ disk និងមិនដំណើរការឯកសារឡើយ។
+    // ប្រសិនបើចាំបាច់ត្រូវរក្សាទុក សូមប្រើ storage ដែលមានការគ្រប់គ្រងសុវត្ថិភាព។
+    res.json({
+      success: true,
+      originalName: req.file.originalname,
+      size: req.file.size,
+      message: 'ទទួលឯកសាររួចរាល់',
+    });
   }
+);
+
+// ផ្ញើសារកំហុសទូទៅទៅ client; កុំបង្ហាញ stack ឬព័ត៌មានខាងក្នុង។
+app.use((err, _req, res, _next) => {
+  console.error('Server error:', err);
+
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({ error: 'ឯកសារមិនត្រឹមត្រូវ ឬធំពេក' });
+  }
+
+  if (err.message === 'Origin មិនត្រូវបានអនុញ្ញាត') {
+    return res.status(403).json({ error: 'Origin មិនត្រូវបានអនុញ្ញាត' });
+  }
+
+  res.status(500).json({ error: 'មានបញ្ហាខាងក្នុង server' });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 MooGold Clone Backend Server running on port ${PORT}`));
+const port = Number(process.env.PORT) || 3000;
+app.listen(port, () => {
+  console.log(`MooGold API server running on port ${port}`);
+});
