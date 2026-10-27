@@ -163,7 +163,46 @@ app.post('/api/moogold/create-order', async (req, res) => {
     sendError(res, err);
   }
 });
+// 3. ពិនិត្យឈ្មោះ Player / Validate Player ID (តាមស្ដង់ដារ product/validate របស់ MooGold)
+app.post('/api/moogold/validate-player', async (req, res) => {
+  try {
+    const { partnerId, secretKey, variationId, playerId, serverId } = req.body || {};
 
+    if (!variationId || !playerId) {
+      return res.status(400).json({
+        error: 'ត្រូវបញ្ចូល Variation ID និង Player ID។'
+      });
+    }
+
+    const validateData = {
+      'product-id': String(variationId),
+      'User ID': String(playerId)
+    };
+
+    if (serverId) {
+      validateData.Server = String(serverId);
+    }
+
+    const payload = {
+      path: 'product/validate',
+      data: validateData
+    };
+
+    const result = await callMooGoldApi(
+      'product/validate',
+      payload,
+      partnerId,
+      secretKey
+    );
+
+    res.json({
+      success: true,
+      moogoldResponse: result
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
 const PORT = Number(process.env.PORT) || 3000;
 
 app.listen(PORT, () => {
