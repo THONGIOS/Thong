@@ -8,7 +8,6 @@ const crypto = require('crypto');
 const app = express();
 
 app.use(helmet());
-// អនុញ្ញាតឱ្យ Frontend (Netlify) ហៅចូលបានដោយមិនជាប់បម្រាម CORS
 app.use(cors({
   origin: process.env.FRONTEND_ORIGIN || '*'
 }));
@@ -21,7 +20,20 @@ app.get('/', (req, res) => {
   });
 });
 
-// អនុគមន៍បង្កើតលេខកូដបញ្ជាទិញថ្មីរហូត មិនឱ្យជាន់គ្នា (Unique Partner Order ID)
+// ចូលទៅកាន់ https://thong-1.onrender.com/my-ip ដើម្បីមើលលេខ IP ពិតប្រាកដរបស់ Server យកទៅដាក់ក្នុង MooGold Whitelist
+app.get('/my-ip', async (req, res) => {
+  try {
+    const r = await fetch('https://api.ipify.org?format=json');
+    const data = await r.json();
+    res.json({
+      exact_server_ip: data.ip,
+      note: 'សូមយកលេខ exact_server_ip នេះទៅដាក់ក្នុង IP Whitelist នៅលើ MooGold.com'
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 function generatePartnerOrderId() {
   const timestamp = Date.now();
   const randomStr = crypto.randomBytes(3).toString('hex').toUpperCase();
@@ -33,7 +45,7 @@ async function callMooGoldApi(endpointPath, payloadObj, customPartnerId, customS
   const secretKey = customSecretKey || process.env.MOOGOLD_SECRET_KEY;
 
   if (!partnerId || !secretKey) {
-    throw new Error('សូមដាក់ MOOGOLD_PARTNER_ID និង MOOGOLD_SECRET_KEY នៅក្នុង Environment របស់ Render!');
+    throw new Error('សូមដាក់ MOOGOLD_PARTNER_ID និង MOOGOLD_SECRET_KEY ឱ្យបានត្រឹមត្រូវ!');
   }
 
   const timestamp = Math.floor(Date.now() / 1000);
@@ -55,6 +67,8 @@ async function callMooGoldApi(endpointPath, payloadObj, customPartnerId, customS
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'Accept': 'application/json, text/plain, */*',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         timestamp: String(timestamp),
         auth: authSignature,
         Authorization: `Basic ${basicAuth}`
@@ -103,7 +117,7 @@ app.post('/api/moogold/balance', async (req, res) => {
   }
 });
 
-// 2. បង្កើតការបញ្ជាទិញ (order/create_order) + Generate Partner Order ID ថ្មីរហូត
+// 2. បង្កើតការបញ្ជាទិញ (order/create_order)
 app.post('/api/moogold/create-order', async (req, res) => {
   try {
     const { partnerId, secretKey, variationId, playerId, serverId, partnerOrderId } = req.body || {};
@@ -114,7 +128,6 @@ app.post('/api/moogold/create-order', async (req, res) => {
       });
     }
 
-    // បើមិនមានផ្ញើ partnerOrderId មកទេ វានឹងបង្កើតលេខកូដថ្មីដោយស្វ័យប្រវត្តិគ្រប់ពេល Top-up
     const uniqueOrderId = partnerOrderId || generatePartnerOrderId();
 
     const orderData = {
