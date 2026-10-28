@@ -477,7 +477,10 @@ app.post('/api/bakong/check-and-fulfill', rateLimiter(60, 60000), async (req, re
     if (forceAdminApprove && verifyAdminAuth(req)) {
       isPaid = true;
     } else {
-      const tokenToUse = (bakongToken || process.env.BAKONG_TOKEN || '').trim();
+      // គាំទ្រការដាក់ Bakong Token ច្រើនចូលគ្នា (បំបែកដោយសញ្ញាក្បៀស ,) ដើម្បីបង្កើន Quota រាប់រយដងក្នុងមួយថ្ងៃ
+      const rawTokens = (bakongToken || process.env.BAKONG_TOKEN || '').trim();
+      const tokenList = rawTokens.split(',').map(t => t.trim()).filter(Boolean);
+      const tokenToUse = tokenList.length > 0 ? tokenList[Math.floor(Math.random() * tokenList.length)] : '';
       if (!tokenToUse) {
         return res.json({
           success: true,
