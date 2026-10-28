@@ -305,8 +305,75 @@ app.post('/api/moogold/list-products', rateLimiter(30, 60000), async (req, res) 
   }
 });
 
+// បន្ថែមអនុគមន៍ឆ្លាតវៃសម្រាប់ទាញយកឈ្មោះ Player ពីគ្រប់ទម្រង់ JSON របស់ MooGold
+function extractPlayerNameFromResult(result) {
+  if (!result || typeof result !== 'object') return null;
+
+  // 1. ឆែក Key សំខាន់ៗផ្ទាល់
+  const directCandidates = [
+    result.username,
+    result.player_name,
+    result.name,
+    result.ign,
+    result.nickname,
+    result.account_name,
+    result.user_name,
+    result.character_name,
+    result.role_name,
+    result['Player Name'],
+    result['User Name'],
+    result['Nickname']
+  ];
+
+  for (const cand of directCandidates) {
+    if (typeof cand === 'string' && cand.trim() && !isInvalidPlayerNameText(cand)) {
+      return cand.trim();
+    }
+  }
+
+  // 2. ឆែកក្នុង result.data ឬ result.details ប្រសិនបើជា Object
+  const subObjects = [result.data, result.details, result.info, result.player];
+  for (const sub of subObjects) {
+    if (sub && typeof sub === 'object') {
+      const subCandidates = [
+        sub.username,
+        sub.player_name,
+        sub.name,
+        sub.ign,
+        sub.nickname,
+        sub.account_name,
+        sub.user_name,
+        sub.character_name,
+        sub['Player Name'],
+        sub['Nickname']
+      ];
+      for (const cand of subCandidates) {
+        if (typeof cand === 'string' && cand.trim() && !isInvalidPlayerNameText(cand)) {
+          return cand.trim();
+        }
+      }
+    } else if (typeof sub === 'string' && sub.trim() && !isInvalidPlayerNameText(sub)) {
+      return sub.trim();
+    }
+  }
+
+  // 3. ឆែកក្នុង result.message (ឧទាហរណ៍៖ "Player Name: SOUYAKTHONG" ឬឈ្មោះផ្ទាល់)
+  if (typeof result.message === 'string' && result.message.trim()) {
+    const msg = result.message.trim();
+    const colonMatch = msg.match(/(?:player\s*name|username|nickname|ign|name)\s*[:=-]\s*(.+)$/i);
+    if (colonMatch && colonMatch[1] && !isInvalidPlayerNameText(colonMatch[1])) {
+      return colonMatch[1].trim();
+    }
+    if (!isInvalidPlayerNameText(msg)) {
+      return msg;
+    }
+  }
+
+  return null;
+}
+
 // ពិនិត្យឈ្មោះ Player / UID ពិតប្រាកដ (product/validate)
-app.post('/api/moogold/validate-player', rateLimiter(45, 60000), async (req, res) => {
+app.post('/api/moogold/validate-player', rateLimiter(60, 60000), async (req, res) => {
   try {
     const { partnerId, secretKey, variationId, playerId, serverId } = req.body || {};
 
@@ -323,11 +390,14 @@ app.post('/api/moogold/validate-player', rateLimiter(45, 60000), async (req, res
 
     const validateData = {
       'product-id': String(cleanVariationId),
-      'User ID': String(cleanPlayerId)
+      'User ID': String(cleanPlayerId),
+      'Player ID': String(cleanPlayerId)
     };
 
     if (cleanServerId) {
       validateData.Server = String(cleanServerId);
+      validateData['Server ID'] = String(cleanServerId);
+      validateData['Zone ID'] = String(cleanServerId);
     }
 
     const payload = {
@@ -336,18 +406,7 @@ app.post('/api/moogold/validate-player', rateLimiter(45, 60000), async (req, res
     };
 
     const result = await callMooGoldApi('product/validate', payload, partnerId, secretKey);
-
-    let extractedName =
-      result.username ||
-      result.player_name ||
-      result.name ||
-      result.ign ||
-      (result.data && (result.data.username || result.data.player_name || result.data.name)) ||
-      (!isInvalidPlayerNameText(result.message) ? result.message : null);
-
-    if (isInvalidPlayerNameText(extractedName)) {
-      extractedName = null;
-    }
+    const extractedName = extractPlayerNameFromResult(result);
 
     const rawMsg = String(result.message || '');
     if (!extractedName && rawMsg.toLowerCase().includes('validation is not available')) {
@@ -360,10 +419,10 @@ app.post('/api/moogold/validate-player', rateLimiter(45, 60000), async (req, res
       });
     }
 
-    if (!extractedName || result.status === false || result.err_code) {
+    if (!extractedName || result.status === false || result.status === 'false' || result.err_code) {
       return res.status(400).json({
         success: false,
-        error: 'រកមិនឃើញឈ្មោះគណនីនេះទេ សូមពិនិត្យលេខ ID ឱ្យច្បាស់មុនបញ្ជាទិញ។',
+        error: 'រកមិនឃើញឈ្មោះគណនីនេះទេ សូមពិនិត្យលេខ ID (និង Server ID បើមាន) ឱ្យច្បាស់មុនបញ្ជាទិញ។',
         moogoldResponse: result
       });
     }
@@ -534,17 +593,79 @@ app.post('/api/bakong/check-and-fulfill', rateLimiter(60, 60000), async (req, re
       partnerOrderId: orderRecord.partnerOrderId
     };
 
-    const moogoldResult = await callMooGoldApi('order/create_order', moogoldPayload);
-    orderRecord.status = 'COMPLETED';
-    orderRecord.moogoldResult = moogoldResult;
+    try {
+      const moogoldResult = await callMooGoldApi('order/create_order', moogoldPayload);
+      orderRecord.status = 'COMPLETED';
+      orderRecord.moogoldResult = moogoldResult;
+
+      return res.json({
+        success: true,
+        paid: true,
+        fulfilled: true,
+        partnerOrderId: orderRecord.partnerOrderId,
+        moogoldResponse: moogoldResult,
+        bakongData
+      });
+    } catch (moogoldErr) {
+      // 🛡️ ប្រព័ន្ធការពារ (Safety Net)៖ ពេលភ្ញៀវបង់លុយចូលធនាគាររួចហើយ តែ MooGold API គាំង ឬកំពុង Update
+      orderRecord.status = 'PAID_PENDING_MOOGOLD';
+      orderRecord.lastError = moogoldErr.message;
+
+      return res.json({
+        success: true,
+        paid: true,
+        fulfilled: false,
+        moogoldDown: true,
+        partnerOrderId: orderRecord.partnerOrderId,
+        message: 'ទទួលបានការបង់ប្រាក់ជោគជ័យ! ប៉ុន្តែប្រព័ន្ធហ្គេម (MooGold) កំពុងធ្វើបច្ចុប្បន្នភាព។ ក្រុមការងារនឹងបញ្ចូលជូនភ្លាមៗ!',
+        errorDetail: moogoldErr.message,
+        bakongData
+      });
+    }
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+
+// គ. មុខងារសម្រាប់ Admin ចុចបាញ់បញ្ចូលទឹកប្រាក់ម្ដងទៀត (Retry) សម្រាប់វិក្កយបត្រដែលភ្ញៀវបង់លុយរួច តែ MooGold គាំង
+app.post('/api/bakong/retry-pending-orders', rateLimiter(20, 60000), async (req, res) => {
+  try {
+    if (!verifyAdminAuth(req)) {
+      return res.status(403).json({ success: false, error: 'គ្មានសិទ្ធិ Admin ទេ!' });
+    }
+
+    const retried = [];
+    for (const [md5Key, rec] of khqrOrdersMap.entries()) {
+      if (rec.status === 'PAID_PENDING_MOOGOLD') {
+        try {
+          const orderData = {
+            category: 1,
+            'product-id': String(rec.variationId),
+            quantity: 1,
+            'User ID': String(rec.playerId)
+          };
+          if (rec.serverId) orderData.Server = String(rec.serverId);
+
+          const moogoldResult = await callMooGoldApi('order/create_order', {
+            path: 'order/create_order',
+            data: orderData,
+            partnerOrderId: rec.partnerOrderId
+          });
+
+          rec.status = 'COMPLETED';
+          rec.moogoldResult = moogoldResult;
+          retried.push({ partnerOrderId: rec.partnerOrderId, playerId: rec.playerId, status: 'SUCCESS' });
+        } catch (err) {
+          retried.push({ partnerOrderId: rec.partnerOrderId, playerId: rec.playerId, status: 'STILL_FAILED', error: err.message });
+        }
+      }
+    }
 
     res.json({
       success: true,
-      paid: true,
-      fulfilled: true,
-      partnerOrderId: orderRecord.partnerOrderId,
-      moogoldResponse: moogoldResult,
-      bakongData
+      retriedCount: retried.length,
+      results: retried
     });
   } catch (err) {
     sendError(res, err);
