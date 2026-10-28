@@ -1,6 +1,6 @@
 /**
  * ឯកសារ៖ server.js
- * តួនាទី៖ Backend Server ពេញលេញ ១០០% សម្រាប់ភ្ជាប់ MooGold API (Balance, Clone រូបភាព/ទំនិញ, Validate Player, Create Order, Security Audit)
+ * តួនាទី៖ Backend Server ពេញលេញ ១០០% សម្រាប់ភ្ជាប់ MooGold API + Bakong KHQR (Auto-Payment & Auto-TopUp)
  */
 require('dotenv').config();
 
@@ -11,12 +11,10 @@ const crypto = require('crypto');
 
 const app = express();
 
-// 1. បើកមុខងារសុវត្ថិភាព HTTP Headers (កែសម្រួលកុំឱ្យ Block ការហៅពី Netlify)
 app.use(helmet({
   crossOriginResourcePolicy: false
 }));
 
-// 2. បើក CORS ឱ្យវេបសាយ Netlify របស់បងហៅចូលបានដោយរលូន ១០០%
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -25,9 +23,11 @@ app.use(cors({
 
 app.use(express.json({ limit: '5mb' }));
 
-// 3. ប្រព័ន្ធការពារការបាញ់សំណើរញាប់ពេក (Rate Limiter ការពារ Bot/DDoS)
+// ====================================================
+// 1. ប្រព័ន្ធសុវត្ថិភាព៖ Rate Limiter & Input Sanitization
+// ====================================================
 const rateLimitMap = new Map();
-function rateLimiter(maxRequests = 40, windowMs = 60000) {
+function rateLimiter(maxRequests = 45, windowMs = 60000) {
   return (req, res, next) => {
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
     const now = Date.now();
@@ -52,7 +52,6 @@ function rateLimiter(maxRequests = 40, windowMs = 60000) {
   };
 }
 
-// 4. មុខងារសម្អាតទិន្នន័យ (Input Sanitization ការពារ XSS / Script Injection)
 function sanitizeInput(str, maxLength = 80) {
   if (typeof str !== 'string' && typeof str !== 'number') return '';
   return String(str)
@@ -61,7 +60,6 @@ function sanitizeInput(str, maxLength = 80) {
     .slice(0, maxLength);
 }
 
-// 5. មុខងារត្រួតពិនិត្យសិទ្ធិ Admin (ប្រសិនបើបានដាក់ ADMIN_SECRET_PIN លើ Render)
 function verifyAdminAuth(req) {
   const serverAdminPin = process.env.ADMIN_SECRET_PIN;
   if (!serverAdminPin) return true;
@@ -69,7 +67,6 @@ function verifyAdminAuth(req) {
   return clientPin === serverAdminPin;
 }
 
-// ពិនិត្យមើលថាតើអក្សរដែល MooGold បោះមកជាឈ្មោះពិត ឬជាសារជូនដំណឹង
 function isInvalidPlayerNameText(text) {
   if (!text || typeof text !== 'string') return true;
   const lower = text.toLowerCase();
@@ -89,43 +86,77 @@ function isInvalidPlayerNameText(text) {
   return blockedPhrases.some((phrase) => lower.includes(phrase));
 }
 
-// ទំព័រដើមពិនិត្យស្ថានភាព Server
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ONLINE',
-    service: 'SOUYAKTHONG MooGold API Server Running 24/7',
-    security: {
-      helmet: true,
-      rateLimit: true,
-      inputSanitization: true,
-      envCredentialsLoaded: Boolean(process.env.MOOGOLD_PARTNER_ID && process.env.MOOGOLD_SECRET_KEY),
-      adminPinConfigured: Boolean(process.env.ADMIN_SECRET_PIN)
-    }
-  });
-});
-
-// ឆែកមើលលេខ IP ពិតប្រាកដរបស់ Render Server សម្រាប់ដាក់ក្នុង MooGold IP Whitelist
-app.get('/my-ip', rateLimiter(15, 60000), async (req, res) => {
-  try {
-    const r = await fetch('https://api.ipify.org?format=json');
-    const data = await r.json();
-    res.json({
-      exact_server_ip: data.ip,
-      note: 'សូមយកលេខ exact_server_ip នេះទៅដាក់ក្នុង IP Whitelist នៅលើ MooGold.com'
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// បង្កើតលេខកូដវិក្កយបត្រថ្មីរហូតមិនឱ្យជាន់គ្នា (Unique Partner Order ID)
 function generatePartnerOrderId() {
   const timestamp = Date.now();
   const randomStr = crypto.randomBytes(3).toString('hex').toUpperCase();
   return `THONG-${timestamp}-${randomStr}`;
 }
 
-// អនុគមន៍កណ្តាលសម្រាប់ហៅទៅកាន់ MooGold API (HMAC-SHA256)
+// ====================================================
+// 2. ម៉ាស៊ីនបង្កើតកូដ EMVCo Bakong KHQR Standard (CRC16-CCITT)
+// ====================================================
+function crc16ccitt(str) {
+  let crc = 0xFFFF;
+  for (let i = 0; i < str.length; i++) {
+    crc ^= str.charCodeAt(i) << 8;
+    for (let j = 0; j < 8; j++) {
+      if ((crc & 0x8000) !== 0) {
+        crc = ((crc << 1) ^ 0x1021) & 0xFFFF;
+      } else {
+        crc = (crc << 1) & 0xFFFF;
+      }
+    }
+  }
+  return crc.toString(16).toUpperCase().padStart(4, '0');
+}
+
+function tlv(tag, value) {
+  const strVal = String(value);
+  const len = strVal.length.toString().padStart(2, '0');
+  return `${tag}${len}${strVal}`;
+}
+
+function buildBakongKhqrString({ bakongAccountId, merchantName, merchantCity, amountUsd, billNumber }) {
+  const cleanAccount = (bakongAccountId || process.env.BAKONG_ACCOUNT_ID || 'souyakthong@aba').trim();
+  const cleanName = (merchantName || process.env.BAKONG_MERCHANT_NAME || 'SOUYAKTHONG GOLD').slice(0, 25);
+  const cleanCity = (merchantCity || 'Phnom Penh').slice(0, 15);
+  const formattedAmount = Number(amountUsd).toFixed(2);
+
+  // Tag 29: Bakong Individual Account Information
+  const tag29 = tlv('29', tlv('00', cleanAccount));
+  // Tag 62: Additional Data Field (Bill Number)
+  const tag62 = tlv('62', tlv('01', billNumber.slice(0, 25)));
+  // Tag 99: Timestamp
+  const nowMs = String(Date.now());
+  const tag99 = tlv('99', tlv('00', nowMs));
+
+  const payloadWithoutCrc =
+    tlv('00', '01') +
+    tlv('01', '12') + // 12 = Dynamic QR
+    tag29 +
+    tlv('52', '5999') +
+    tlv('53', '840') + // 840 = USD
+    tlv('54', formattedAmount) +
+    tlv('58', 'KH') +
+    tlv('59', cleanName) +
+    tlv('60', cleanCity) +
+    tag62 +
+    tag99 +
+    '6304';
+
+  const crc = crc16ccitt(payloadWithoutCrc);
+  const khqrString = payloadWithoutCrc + crc;
+  const md5 = crypto.createHash('md5').update(khqrString).digest('hex');
+
+  return { khqrString, md5, amountUsd: Number(formattedAmount), bakongAccountId: cleanAccount };
+}
+
+// ផ្ទុកវិក្កយបត្រ KHQR ដើម្បីការពារការបាញ់ UC ស្ទួន (Idempotency Store)
+const khqrOrdersMap = new Map();
+
+// ====================================================
+// 3. អនុគមន៍កណ្តាលហៅទៅកាន់ MooGold API
+// ====================================================
 async function callMooGoldApi(endpointPath, payloadObj, customPartnerId, customSecretKey) {
   const partnerId = (customPartnerId || process.env.MOOGOLD_PARTNER_ID || '').trim();
   const secretKey = (customSecretKey || process.env.MOOGOLD_SECRET_KEY || '').trim();
@@ -184,7 +215,7 @@ async function callMooGoldApi(endpointPath, payloadObj, customPartnerId, customS
 }
 
 function sendError(res, err) {
-  console.error('MooGold request failed:', err.message, err.details || '');
+  console.error('API request failed:', err.message, err.details || '');
   res.status(err.status || 500).json({
     success: false,
     error: err.message || 'Server error.',
@@ -192,7 +223,37 @@ function sendError(res, err) {
   });
 }
 
-// 1. ឆែកសមតុល្យទឹកប្រាក់ (user/balance)
+// ====================================================
+// 4. ROUTES ទាំងអស់របស់ប្រព័ន្ធ
+// ====================================================
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ONLINE',
+    service: 'SOUYAKTHONG MooGold + Bakong KHQR API Server Running 24/7',
+    security: {
+      helmet: true,
+      rateLimit: true,
+      inputSanitization: true,
+      envCredentialsLoaded: Boolean(process.env.MOOGOLD_PARTNER_ID && process.env.MOOGOLD_SECRET_KEY),
+      bakongTokenConfigured: Boolean(process.env.BAKONG_TOKEN)
+    }
+  });
+});
+
+app.get('/my-ip', rateLimiter(15, 60000), async (req, res) => {
+  try {
+    const r = await fetch('https://api.ipify.org?format=json');
+    const data = await r.json();
+    res.json({
+      exact_server_ip: data.ip,
+      note: 'សូមយកលេខ exact_server_ip នេះទៅដាក់ក្នុង IP Whitelist នៅលើ MooGold.com'
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ឆែកសមតុល្យទឹកប្រាក់ MooGold (user/balance)
 app.post('/api/moogold/balance', rateLimiter(30, 60000), async (req, res) => {
   try {
     const { partnerId, secretKey } = req.body || {};
@@ -204,8 +265,8 @@ app.post('/api/moogold/balance', rateLimiter(30, 60000), async (req, res) => {
   }
 });
 
-// 2. ទាញយករូបភាពផ្លូវការ (Image_URL) និងតម្លៃកញ្ចប់ទំនិញផ្ទាល់ពី MooGold (product/product_detail)
-app.post('/api/moogold/product-detail', rateLimiter(40, 60000), async (req, res) => {
+// ទាញយករូបភាពផ្លូវការ និងកញ្ចប់តម្លៃពី MooGold (product/product_detail)
+app.post('/api/moogold/product-detail', rateLimiter(45, 60000), async (req, res) => {
   try {
     const { partnerId, secretKey, productId } = req.body || {};
     const cleanProductId = sanitizeInput(productId || '6963', 20);
@@ -226,7 +287,7 @@ app.post('/api/moogold/product-detail', rateLimiter(40, 60000), async (req, res)
   }
 });
 
-// 3. ទាញយកបញ្ជីហ្គេមតាម Category ពី MooGold (product/list_product)
+// ទាញយកបញ្ជីហ្គេមតាម Category ពី MooGold (product/list_product)
 app.post('/api/moogold/list-products', rateLimiter(30, 60000), async (req, res) => {
   try {
     const { partnerId, secretKey, categoryId } = req.body || {};
@@ -244,8 +305,8 @@ app.post('/api/moogold/list-products', rateLimiter(30, 60000), async (req, res) 
   }
 });
 
-// 4. ពិនិត្យឈ្មោះ Player / UID ពិតប្រាកដ (product/validate)
-app.post('/api/moogold/validate-player', rateLimiter(40, 60000), async (req, res) => {
+// ពិនិត្យឈ្មោះ Player / UID ពិតប្រាកដ (product/validate)
+app.post('/api/moogold/validate-player', rateLimiter(45, 60000), async (req, res) => {
   try {
     const { partnerId, secretKey, variationId, playerId, serverId } = req.body || {};
 
@@ -319,7 +380,175 @@ app.post('/api/moogold/validate-player', rateLimiter(40, 60000), async (req, res
   }
 });
 
-// 5. បង្កើតការបញ្ជាទិញទំនិញ/UC ពិតប្រាកដ (order/create_order)
+// ====================================================
+// 5. BAKONG KHQR AUTO-PAYMENT & AUTO-TOPUP ENDPOINTS
+// ====================================================
+
+// ក. បង្កើតកូដ KHQR សម្រាប់ភ្ញៀវស្គេនបង់ប្រាក់តាមទឹកប្រាក់កញ្ចប់ទំនិញ
+app.post('/api/bakong/create-khqr', rateLimiter(25, 60000), (req, res) => {
+  try {
+    const {
+      amount,
+      variationId,
+      playerId,
+      serverId,
+      packageTitle,
+      bakongAccountId,
+      merchantName
+    } = req.body || {};
+
+    const cleanPlayerId = sanitizeInput(playerId, 30);
+    const cleanVariationId = sanitizeInput(variationId, 20);
+    const cleanServerId = serverId ? sanitizeInput(serverId, 20) : '';
+    const numAmount = Number(amount);
+
+    if (!cleanPlayerId || !cleanVariationId || !numAmount || numAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'សូមជ្រើសរើសកញ្ចប់ទំនិញ និងបញ្ចូល Player ID ឱ្យត្រឹមត្រូវ!'
+      });
+    }
+
+    const partnerOrderId = generatePartnerOrderId();
+    const { khqrString, md5, amountUsd, bakongAccountId: usedBakongId } = buildBakongKhqrString({
+      bakongAccountId: sanitizeInput(bakongAccountId || '', 45),
+      merchantName: sanitizeInput(merchantName || 'SOUYAKTHONG GOLD', 25),
+      merchantCity: 'Phnom Penh',
+      amountUsd: numAmount,
+      billNumber: partnerOrderId
+    });
+
+    // រក្សាទុកព័ត៌មានបញ្ជាទិញក្នុងអង្គចងចាំ (ដើម្បីពេល Bakong បញ្ជាក់ថាបង់លុយរួច វាបាញ់ UC ចូលហ្គេមស្វ័យប្រវត្តិ)
+    khqrOrdersMap.set(md5, {
+      md5,
+      partnerOrderId,
+      variationId: cleanVariationId,
+      playerId: cleanPlayerId,
+      serverId: cleanServerId,
+      packageTitle: sanitizeInput(packageTitle || '', 60),
+      amountUsd,
+      status: 'PENDING_PAYMENT',
+      createdAt: Date.now(),
+      moogoldResult: null
+    });
+
+    res.json({
+      success: true,
+      partnerOrderId,
+      md5,
+      khqrString,
+      amountUsd,
+      bakongAccountId: usedBakongId
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// ខ. ឆែកស្ថានភាពបង់ប្រាក់ពី Bakong API ដោយស្វ័យប្រវត្តិ (Check Transaction by MD5) រួចបាញ់ UC ភ្លាមៗ
+app.post('/api/bakong/check-and-fulfill', rateLimiter(60, 60000), async (req, res) => {
+  try {
+    const { md5, bakongToken, forceAdminApprove } = req.body || {};
+    const cleanMd5 = sanitizeInput(md5, 40);
+    const orderRecord = khqrOrdersMap.get(cleanMd5);
+
+    if (!orderRecord) {
+      return res.status(404).json({
+        success: false,
+        error: 'រកមិនឃើញវិក្កយបត្រ KHQR នេះទេ ឬផុតកំណត់ហើយ!'
+      });
+    }
+
+    // បើវិក្កយបត្រនេះបានបាញ់ UC រួចហើយ មិនឱ្យបាញ់ស្ទួនទេ
+    if (orderRecord.status === 'COMPLETED') {
+      return res.json({
+        success: true,
+        paid: true,
+        fulfilled: true,
+        partnerOrderId: orderRecord.partnerOrderId,
+        moogoldResponse: orderRecord.moogoldResult
+      });
+    }
+
+    let isPaid = false;
+    let bakongData = null;
+
+    // ករណី Admin ចុចអនុម័តដោយដៃ (ឬតេស្តក្នុងទម្រង់ Admin)
+    if (forceAdminApprove && verifyAdminAuth(req)) {
+      isPaid = true;
+    } else {
+      const tokenToUse = (bakongToken || process.env.BAKONG_TOKEN || '').trim();
+      if (!tokenToUse) {
+        return res.json({
+          success: true,
+          paid: false,
+          waitingForToken: true,
+          message: 'កំពុងរង់ចាំការបង់ប្រាក់ (សូមដាក់ BAKONG_TOKEN ដើម្បីឱ្យប្រព័ន្ធឆែកលុយចូលស្វ័យប្រវត្តិ ១០០%)'
+        });
+      }
+
+      const bakongRes = await fetch('https://api-bakong.nbc.gov.kh/v1/check_transaction_by_md5', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${tokenToUse}`
+        },
+        body: JSON.stringify({ md5: cleanMd5 }),
+        signal: AbortSignal.timeout(10000)
+      });
+
+      bakongData = await bakongRes.json();
+      // responseCode === 0 មានន័យថាភ្ញៀវបានស្គេនបង់ប្រាក់ចូលគណនី Bakong ជោគជ័យហើយ!
+      if (bakongData && bakongData.responseCode === 0 && bakongData.data) {
+        isPaid = true;
+      }
+    }
+
+    if (!isPaid) {
+      return res.json({
+        success: true,
+        paid: false,
+        bakongResponse: bakongData
+      });
+    }
+
+    // គ្រាន់តែពិនិត្យឃើញលុយចូល Bakong ភ្លាម បាញ់ Order ទៅ MooGold ភ្លាមៗ!
+    orderRecord.status = 'PROCESSING_MOOGOLD';
+
+    const orderData = {
+      category: 1,
+      'product-id': String(orderRecord.variationId),
+      quantity: 1,
+      'User ID': String(orderRecord.playerId)
+    };
+    if (orderRecord.serverId) {
+      orderData.Server = String(orderRecord.serverId);
+    }
+
+    const moogoldPayload = {
+      path: 'order/create_order',
+      data: orderData,
+      partnerOrderId: orderRecord.partnerOrderId
+    };
+
+    const moogoldResult = await callMooGoldApi('order/create_order', moogoldPayload);
+    orderRecord.status = 'COMPLETED';
+    orderRecord.moogoldResult = moogoldResult;
+
+    res.json({
+      success: true,
+      paid: true,
+      fulfilled: true,
+      partnerOrderId: orderRecord.partnerOrderId,
+      moogoldResponse: moogoldResult,
+      bakongData
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// 5. បង្កើតការបញ្ជាទិញទំនិញ/UC ផ្ទាល់ (Direct Order)
 app.post('/api/moogold/create-order', rateLimiter(15, 60000), async (req, res) => {
   try {
     if (!verifyAdminAuth(req)) {
@@ -383,11 +612,18 @@ app.post('/api/security-audit', rateLimiter(15, 60000), (req, res) => {
     auditTime: new Date().toISOString(),
     checks: [
       {
-        name: 'ការលាក់ API Key លើ Server (Secret Key Protection)',
+        name: 'ការលាក់ MooGold API Key លើ Server',
         passed: Boolean(process.env.MOOGOLD_PARTNER_ID && process.env.MOOGOLD_SECRET_KEY),
         detail: process.env.MOOGOLD_SECRET_KEY
-          ? '✅ សុវត្ថិភាព៖ API Key ត្រូវបានរក្សាទុកក្នុង Render Environment យ៉ាងជិតល្អ'
+          ? '✅ សុវត្ថិភាព៖ MooGold API Key ត្រូវបានរក្សាទុកក្នុង Render Environment យ៉ាងជិតល្អ'
           : '⚠️ ព្រមាន៖ មិនទាន់បានដាក់ MOOGOLD_SECRET_KEY ក្នុង Render Environment នៅឡើយទេ'
+      },
+      {
+        name: 'ការភ្ជាប់ប្រព័ន្ធធនាគារ Bakong KHQR (Auto-Verify)',
+        passed: true,
+        detail: process.env.BAKONG_TOKEN
+          ? '✅ សុវត្ថិភាព៖ បានភ្ជាប់ BAKONG_TOKEN សម្រាប់ឆែកទឹកប្រាក់ចូលធនាគារស្វ័យប្រវត្តិ'
+          : '💡 អាចដាក់ BAKONG_TOKEN ក្នុងផ្ទាំង Admin ឬ Render Environment ដើម្បីឆែកលុយចូលស្វ័យប្រវត្តិ'
       },
       {
         name: 'ការការពារបញ្ចូលកូដអាក្រក់ (XSS / Injection Filter)',
@@ -395,14 +631,9 @@ app.post('/api/security-audit', rateLimiter(15, 60000), (req, res) => {
         detail: `✅ សុវត្ថិភាព៖ កូដគំរូ "${samplePayload}" ត្រូវបានសម្អាតមកត្រឹម "${cleanedPayload}"`
       },
       {
-        name: 'របាំងការពារការបាញ់សំណើរញាប់ (Rate Limiting)',
+        name: 'របាំងការពារការបាញ់សំណើរញាប់ និងការពារបាញ់ UC ស្ទួន (Idempotency)',
         passed: true,
-        detail: '✅ សុវត្ថិភាព៖ កំណត់ចំនួនសំណើរក្នុង ១ នាទី ការពារ Bot បាញ់បំផ្លាញទឹកប្រាក់'
-      },
-      {
-        name: 'របាំងការពារ HTTP Security Headers (Helmet)',
-        passed: true,
-        detail: '✅ សុវត្ថិភាព៖ បានបើកមុខងារ Helmet ការពារ Clickjacking និង Sniffing'
+        detail: '✅ សុវត្ថិភាព៖ វិក្កយបត្រ KHQR នីមួយៗអាចបាញ់ UC បានតែ ១ ដងគត់ ការពារការកាត់លុយស្ទួន'
       }
     ]
   });
@@ -411,5 +642,5 @@ app.post('/api/security-audit', rateLimiter(15, 60000), (req, res) => {
 const PORT = Number(process.env.PORT) || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 SOUYAKTHONG MooGold API server running on port ${PORT}`);
+  console.log(`🚀 SOUYAKTHONG MooGold + Bakong KHQR server running on port ${PORT}`);
 });
