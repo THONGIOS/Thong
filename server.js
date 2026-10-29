@@ -92,6 +92,92 @@ function generatePartnerOrderId() {
   return `THONG-${timestamp}-${randomStr}`;
 }
 
+
+// ====================================================
+// 1.5 ប្រព័ន្ធរក្សាទុកទិន្នន័យអចិន្ត្រៃយ៍ (Permanent Cloud & Disk Store)
+// គាំទ្រ៖ (1) Cloudflare KV / Upstash / JSONBin / MongoDB Webhook URL ឬ (2) Persistent JSON File
+// ====================================================
+const fs = require('fs');
+const path = require('path');
+
+const PERSISTENT_DIR = process.env.PERSISTENT_DATA_DIR || __dirname;
+const DB_FILE_PATH = path.join(PERSISTENT_DIR, 'souyakthong_permanent_store.json');
+
+let permanentStore = {
+  catalog: null,
+  settings: {},
+  updatedAt: null
+};
+
+// ទាញទិន្នន័យពី Disk ឬ Cloud ពេល Server ចាប់ផ្តើមដំណើរការ
+async function initPermanentStore() {
+  // ក. ទាញពី Local Persistent File ជាមុន
+  try {
+    if (fs.existsSync(DB_FILE_PATH)) {
+      const raw = fs.readFileSync(DB_FILE_PATH, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        permanentStore = { ...permanentStore, ...parsed };
+        console.log('✅ Loaded permanent store from disk:', DB_FILE_PATH);
+      }
+    }
+  } catch (err) {
+    console.warn('⚠️ Disk store read warning:', err.message);
+  }
+
+  // ខ. បើមានភ្ជាប់ Cloud JSONBin / Cloudflare KV REST API ទាញយកទិន្នន័យចុងក្រោយបំផុតពី Cloud
+  const cloudBinId = (process.env.JSONBIN_BIN_ID || '').trim();
+  const cloudApiKey = (process.env.JSONBIN_API_KEY || '').trim();
+  if (cloudBinId && cloudApiKey) {
+    try {
+      const r = await fetch(`https://api.jsonbin.io/v3/b/${cloudBinId}/latest`, {
+        headers: { 'X-Master-Key': cloudApiKey }
+      });
+      if (r.ok) {
+        const j = await r.json();
+        if (j && j.record) {
+          permanentStore = { ...permanentStore, ...j.record };
+          fs.writeFileSync(DB_FILE_PATH, JSON.stringify(permanentStore, null, 2), 'utf-8');
+          console.log('☁️ Synced permanent store from Cloud JSONBin!');
+        }
+      }
+    } catch (e) {
+      console.warn('⚠️ Cloud sync read warning:', e.message);
+    }
+  }
+}
+
+async function savePermanentStore() {
+  permanentStore.updatedAt = new Date().toISOString();
+
+  // 1. រក្សាទុកក្នុង Disk ភ្លាមៗ
+  try {
+    fs.writeFileSync(DB_FILE_PATH, JSON.stringify(permanentStore, null, 2), 'utf-8');
+  } catch (err) {
+    console.warn('⚠️ Disk store write warning:', err.message);
+  }
+
+  // 2. រក្សាទុកទៅកាន់ Cloud (JSONBin.io Free Forever Cloud DB) បើមានកំណត់
+  const cloudBinId = (process.env.JSONBIN_BIN_ID || permanentStore.settings?.jsonbinId || '').trim();
+  const cloudApiKey = (process.env.JSONBIN_API_KEY || permanentStore.settings?.jsonbinKey || '').trim();
+  if (cloudBinId && cloudApiKey) {
+    try {
+      await fetch(`https://api.jsonbin.io/v3/b/${cloudBinId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Master-Key': cloudApiKey
+        },
+        body: JSON.stringify(permanentStore)
+      });
+    } catch (e) {
+      console.warn('⚠️ Cloud sync write warning:', e.message);
+    }
+  }
+}
+
+initPermanentStore();
+
 // ====================================================
 // 2. ម៉ាស៊ីនបង្កើតកូដ EMVCo Bakong KHQR Standard (CRC16-CCITT)
 // ====================================================
@@ -253,6 +339,54 @@ app.get('/my-ip', rateLimiter(15, 60000), async (req, res) => {
   }
 });
 
+
+// ទាញយកទិន្នន័យ Catalog & Settings ដែលបានរក្សាទុកជាអចិន្ត្រៃយ៍លើ Server/Cloud
+app.get('/api/store-data', rateLimiter(60, 60000), (req, res) => {
+  const safeSettings = { ...(permanentStore.settings || {}) };
+  // មិនបញ្ជូន Secret Key ចេញទៅក្រៅទេ បើមិនមែនជា Admin
+  if (!verifyAdminAuth(req)) {
+    delete safeSettings.bakongToken;
+    delete safeSettings.tgToken;
+    delete safeSettings.jsonbinKey;
+  }
+  res.json({
+    success: true,
+    catalog: permanentStore.catalog || null,
+    settings: safeSettings,
+    updatedAt: permanentStore.updatedAt
+  });
+});
+
+// រក្សាទុកទិន្នន័យ Catalog (រូបភាព/តម្លៃហ្គេម) និង Settings ជាអចិន្ត្រៃយ៍លើ Server & Cloud
+app.post('/api/store-data', rateLimiter(30, 60000), async (req, res) => {
+  try {
+    if (!verifyAdminAuth(req)) {
+      return res.status(403).json({
+        success: false,
+        error: 'គ្មានសិទ្ធិ Admin ដើម្បីរក្សាទុកទិន្នន័យទេ (Unauthorized Admin PIN)!'
+      });
+    }
+
+    const { catalog, settings } = req.body || {};
+    if (catalog && typeof catalog === 'object') {
+      permanentStore.catalog = catalog;
+    }
+    if (settings && typeof settings === 'object') {
+      permanentStore.settings = { ...(permanentStore.settings || {}), ...settings };
+    }
+
+    await savePermanentStore();
+
+    res.json({
+      success: true,
+      message: '✅ បានរក្សាទុកទិន្នន័យចូលក្នុងម៉ាស៊ីនមេ និង Cloud ជាអចិន្ត្រៃយ៍រួចរាល់!',
+      updatedAt: permanentStore.updatedAt
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
 // ឆែកសមតុល្យទឹកប្រាក់ MooGold (user/balance)
 app.post('/api/moogold/balance', rateLimiter(30, 60000), async (req, res) => {
   try {
@@ -372,14 +506,183 @@ function extractPlayerNameFromResult(result) {
   return null;
 }
 
-// ពិនិត្យឈ្មោះ Player / UID ពិតប្រាកដ (product/validate)
+
+// អនុគមន៍ជំនួយ៖ ឆែកឈ្មោះ Player ពិតប្រាកដតាមទម្រង់ Midasbuy & Multi-Source Game ID Resolver
+async function lookupPublicGamePlayerName(gameKey, playerId, serverId, variationId) {
+  const cleanId = String(playerId).trim();
+  const cleanZone = String(serverId || '').trim();
+  const gKey = String(gameKey || '').toLowerCase();
+  const varStr = String(variationId || '');
+
+  // កំណត់ប្រភេទហ្គេមតាម gameKey ឬ variationId
+  let slug = '';
+  if (gKey.includes('pubg') || varStr === '6963' || varStr.startsWith('4356') || varStr.startsWith('4085')) {
+    slug = 'pubgm';
+  } else if (gKey.includes('mlbb') || varStr.startsWith('151') || varStr.startsWith('3639') || varStr.startsWith('2144')) {
+    slug = 'mobile-legends';
+  } else if (gKey.includes('ff') || gKey.includes('freefire') || varStr.startsWith('162') || varStr.startsWith('1860') || varStr.startsWith('1101') || varStr.startsWith('2155') || varStr.startsWith('2412')) {
+    slug = 'free-fire';
+  } else if (gKey.includes('genshin') || varStr.startsWith('428')) {
+    slug = 'genshin-impact';
+  } else if (gKey.includes('hsr') || varStr.startsWith('4233')) {
+    slug = 'honkai-star-rail';
+  } else if (gKey.includes('hok') || varStr.startsWith('4177')) {
+    slug = 'honor-of-kings';
+  } else if (gKey.includes('valorant') || varStr.startsWith('546')) {
+    slug = 'valorant';
+  } else if (gKey.includes('codm') || varStr.startsWith('185')) {
+    slug = 'call-of-duty-mobile';
+  } else if (gKey.includes('bloodstrike') || varStr.startsWith('6892')) {
+    slug = 'blood-strike';
+  }
+
+  if (!slug) return null;
+
+  // Source 0 (ពិសេសសម្រាប់ PUBG Mobile)៖ Midasbuy getCharacInfo Gateway & MooGold Validate
+  if (slug === 'pubgm') {
+    // ក. សាកល្បង Midasbuy Official Character Info Endpoint (បើ Midasbuy មិនជាប់ Captcha លើ IP នេះ)
+    try {
+      const midasUrl = `https://www.midasbuy.com/interface/getCharacInfo?appid=1450015065&zoneid=1&openid=${encodeURIComponent(cleanId)}&ct=1`;
+      const midasRes = await fetch(midasUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+          'Referer': 'https://www.midasbuy.com/midasbuy/ot/buy/pubgm',
+          'Accept': 'application/json, text/plain, */*'
+        },
+        signal: AbortSignal.timeout(5000)
+      });
+      if (midasRes.ok) {
+        const midasData = await midasRes.json();
+        const rawCharName =
+          midasData?.charac_name ||
+          midasData?.data?.charac_name ||
+          midasData?.info?.charac_name ||
+          midasData?.nick_name;
+        if (rawCharName) {
+          const decoded = decodeURIComponent(String(rawCharName)).trim();
+          if (decoded && !isInvalidPlayerNameText(decoded)) {
+            return decoded;
+          }
+        }
+      }
+    } catch (e) {
+      // បន្តទៅប្រភពបន្ទាប់ប្រសិនបើ Midasbuy ទាមទារ x- request signature
+    }
+  }
+
+  // Source 1: Isan Public Game Nickname API (ភ្ជាប់ទៅកាន់ Midasbuy / Codashop / Garena Gateways)
+  try {
+    const zoneParam = cleanZone ? `&zone=${encodeURIComponent(cleanZone)}` : '';
+    const url1 = `https://api.isan.eu.org/nickname/${slug}?id=${encodeURIComponent(cleanId)}${zoneParam}`;
+    const res1 = await fetch(url1, { signal: AbortSignal.timeout(6500) });
+    if (res1.ok) {
+      const data1 = await res1.json();
+      if (data1 && data1.success && data1.name && !isInvalidPlayerNameText(String(data1.name))) {
+        return String(data1.name).trim();
+      }
+    }
+  } catch (e) {
+    // បន្តទៅ Source ទី ២
+  }
+
+  // Source 2: Ryzen Public Game Stalk Resolver (Midasbuy PUBG / MLBB / Free Fire Proxy)
+  try {
+    const endpointMap = {
+      'pubgm': `https://api.ryzendesu.vip/api/stalk/pubg?id=${encodeURIComponent(cleanId)}`,
+      'free-fire': `https://api.ryzendesu.vip/api/stalk/ff?id=${encodeURIComponent(cleanId)}`,
+      'mobile-legends': `https://api.ryzendesu.vip/api/stalk/ml?id=${encodeURIComponent(cleanId)}&zoneId=${encodeURIComponent(cleanZone)}`,
+      'genshin-impact': `https://api.ryzendesu.vip/api/stalk/genshin?id=${encodeURIComponent(cleanId)}&server=${encodeURIComponent(cleanZone)}`
+    };
+    if (endpointMap[slug]) {
+      const res2 = await fetch(endpointMap[slug], { signal: AbortSignal.timeout(6500) });
+      if (res2.ok) {
+        const data2 = await res2.json();
+        const name2 = data2?.username || data2?.nickname || data2?.name || data2?.data?.username || data2?.data?.nickname;
+        if (name2 && !isInvalidPlayerNameText(String(name2))) {
+          return String(name2).trim();
+        }
+      }
+    }
+  } catch (e) {
+    // បន្តទៅ Source ទី ៣
+  }
+
+  // Source 3: MooGold Alternative Validate Product IDs (សាកល្បងទាំង 4085924 និង 6963)
+  if (slug === 'pubgm') {
+    for (const testPid of ['4085924', '6963']) {
+      try {
+        const altPayload = {
+          path: 'product/validate',
+          data: {
+            'product-id': testPid,
+            'User ID': cleanId,
+            'Character ID': cleanId,
+            'Player ID': cleanId
+          }
+        };
+        const altRes = await callMooGoldApi('product/validate', altPayload);
+        const altName = extractPlayerNameFromResult(altRes);
+        if (altName) return altName;
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
+
+  return null;
+}
+
+// ទាញយកបញ្ជីឈ្មោះហ្គេម និង MooGold Product ID ពិតប្រាកដទាំងអស់ពីគណនី MooGold ផ្ទាល់ (All Categories)
+app.post('/api/moogold/all-live-products', rateLimiter(20, 60000), async (req, res) => {
+  try {
+    const { partnerId, secretKey } = req.body || {};
+    const categoriesToFetch = [50, 51, 52, 1, 2]; // 50=Direct Topup Games, 51=Gift Cards, etc.
+    const allProductsMap = new Map();
+
+    for (const catId of categoriesToFetch) {
+      try {
+        const data = await callMooGoldApi('product/list_product', {
+          path: 'product/list_product',
+          category_id: catId
+        }, partnerId, secretKey);
+
+        if (Array.isArray(data)) {
+          for (const item of data) {
+            const pid = item.ID || item.id || item.product_id;
+            const pname = item.post_title || item.title || item.Product_Name || item.name;
+            if (pid && pname) {
+              allProductsMap.set(String(pid), {
+                productId: String(pid),
+                title: String(pname),
+                categoryId: catId
+              });
+            }
+          }
+        }
+      } catch (e) {
+        // skip category if not supported
+      }
+    }
+
+    res.json({
+      success: true,
+      totalCount: allProductsMap.size,
+      products: Array.from(allProductsMap.values())
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// ពិនិត្យឈ្មោះ Player / UID ពិតប្រាកដ (product/validate + Multi-Source Fallback សម្រាប់ PUBG, MLBB, FF, Genshin...)
 app.post('/api/moogold/validate-player', rateLimiter(60, 60000), async (req, res) => {
   try {
-    const { partnerId, secretKey, variationId, playerId, serverId } = req.body || {};
+    const { partnerId, secretKey, variationId, playerId, serverId, gameKey } = req.body || {};
 
     const cleanPlayerId = sanitizeInput(playerId, 30);
     const cleanVariationId = sanitizeInput(variationId || '435611', 20);
     const cleanServerId = serverId ? sanitizeInput(serverId, 20) : '';
+    const cleanGameKey = sanitizeInput(gameKey || '', 25);
 
     if (!cleanPlayerId) {
       return res.status(400).json({
@@ -388,50 +691,65 @@ app.post('/api/moogold/validate-player', rateLimiter(60, 60000), async (req, res
       });
     }
 
-    const validateData = {
-      'product-id': String(cleanVariationId),
-      'User ID': String(cleanPlayerId),
-      'Player ID': String(cleanPlayerId)
-    };
+    let result = {};
+    let extractedName = null;
 
-    if (cleanServerId) {
-      validateData.Server = String(cleanServerId);
-      validateData['Server ID'] = String(cleanServerId);
-      validateData['Zone ID'] = String(cleanServerId);
+    // ជំហានទី ១៖ សាកល្បងទាញឈ្មោះពី MooGold API ជាមុន
+    try {
+      const validateData = {
+        'product-id': String(cleanVariationId),
+        'User ID': String(cleanPlayerId),
+        'Player ID': String(cleanPlayerId),
+        'Character ID': String(cleanPlayerId)
+      };
+
+      if (cleanServerId) {
+        validateData.Server = String(cleanServerId);
+        validateData['Server ID'] = String(cleanServerId);
+        validateData['Zone ID'] = String(cleanServerId);
+      }
+
+      const payload = {
+        path: 'product/validate',
+        data: validateData
+      };
+
+      result = await callMooGoldApi('product/validate', payload, partnerId, secretKey);
+      extractedName = extractPlayerNameFromResult(result);
+    } catch (mgErr) {
+      result = { message: mgErr.message };
     }
 
-    const payload = {
-      path: 'product/validate',
-      data: validateData
-    };
+    // ជំហានទី ២៖ ប្រសិនបើ MooGold មិនគាំទ្រការឆែកឈ្មោះសម្រាប់កញ្ចប់នេះ (ដូចជា PUBG Global 435611 ដែលចេញ "validation is not available")
+    // ប្រព័ន្ធនឹងរត់ទៅឆែកឈ្មោះពិតប្រាកដពី Public Game ID Resolver ដោយស្វ័យប្រវត្តិ!
+    if (!extractedName) {
+      extractedName = await lookupPublicGamePlayerName(cleanGameKey, cleanPlayerId, cleanServerId, cleanVariationId);
+    }
 
-    const result = await callMooGoldApi('product/validate', payload, partnerId, secretKey);
-    const extractedName = extractPlayerNameFromResult(result);
-
-    const rawMsg = String(result.message || '');
-    if (!extractedName && rawMsg.toLowerCase().includes('validation is not available')) {
+    if (extractedName) {
       return res.json({
         success: true,
-        validationSupported: false,
-        playerName: 'UID បានត្រៀមរួចរាល់ (កញ្ចប់នេះបញ្ចូលត្រង់តាម ID ដោយមិនបាច់ឆែកឈ្មោះ)',
+        validationSupported: true,
+        playerName: sanitizeInput(extractedName, 50),
         playerId: cleanPlayerId,
         moogoldResponse: result
       });
     }
 
-    if (!extractedName || result.status === false || result.status === 'false' || result.err_code) {
-      return res.status(400).json({
-        success: false,
-        error: 'រកមិនឃើញឈ្មោះគណនីនេះទេ សូមពិនិត្យលេខ ID (និង Server ID បើមាន) ឱ្យច្បាស់មុនបញ្ជាទិញ។',
+    const rawMsg = String(result.message || '');
+    if (rawMsg.toLowerCase().includes('validation is not available')) {
+      return res.json({
+        success: true,
+        validationSupported: false,
+        playerName: `ID: ${cleanPlayerId} (បានត្រៀមរួចរាល់សម្រាប់បញ្ចូលស្វ័យប្រវត្តិ)`,
+        playerId: cleanPlayerId,
         moogoldResponse: result
       });
     }
 
-    res.json({
-      success: true,
-      validationSupported: true,
-      playerName: sanitizeInput(extractedName, 50),
-      playerId: cleanPlayerId,
+    return res.status(400).json({
+      success: false,
+      error: 'រកមិនឃើញឈ្មោះគណនីនេះទេ សូមពិនិត្យលេខ ID (និង Server ID បើមាន) ឱ្យច្បាស់មុនបញ្ជាទិញ។',
       moogoldResponse: result
     });
   } catch (err) {
@@ -581,10 +899,14 @@ app.post('/api/bakong/check-and-fulfill', rateLimiter(60, 60000), async (req, re
       category: 1,
       'product-id': String(orderRecord.variationId),
       quantity: 1,
-      'User ID': String(orderRecord.playerId)
+      'User ID': String(orderRecord.playerId),
+      'Character ID': String(orderRecord.playerId),
+      'Player ID': String(orderRecord.playerId)
     };
     if (orderRecord.serverId) {
       orderData.Server = String(orderRecord.serverId);
+      orderData['Server ID'] = String(orderRecord.serverId);
+      orderData['Zone ID'] = String(orderRecord.serverId);
     }
 
     const moogoldPayload = {
@@ -595,6 +917,17 @@ app.post('/api/bakong/check-and-fulfill', rateLimiter(60, 60000), async (req, re
 
     try {
       const moogoldResult = await callMooGoldApi('order/create_order', moogoldPayload);
+      // ពិនិត្យឱ្យច្បាស់ថាតើ MooGold ពិតជាទទួលយក Order មែនឬអត់ (ការពារករណីលោត COMPLETED ក្លែងក្លាយ)
+      if (
+        !moogoldResult ||
+        moogoldResult.status === false ||
+        moogoldResult.status === 'false' ||
+        moogoldResult.err_code ||
+        (moogoldResult.message && String(moogoldResult.message).toLowerCase().includes('error'))
+      ) {
+        throw new Error(moogoldResult?.message || JSON.stringify(moogoldResult));
+      }
+
       orderRecord.status = 'COMPLETED';
       orderRecord.moogoldResult = moogoldResult;
 
@@ -643,9 +976,15 @@ app.post('/api/bakong/retry-pending-orders', rateLimiter(20, 60000), async (req,
             category: 1,
             'product-id': String(rec.variationId),
             quantity: 1,
-            'User ID': String(rec.playerId)
+            'User ID': String(rec.playerId),
+            'Character ID': String(rec.playerId),
+            'Player ID': String(rec.playerId)
           };
-          if (rec.serverId) orderData.Server = String(rec.serverId);
+          if (rec.serverId) {
+            orderData.Server = String(rec.serverId);
+            orderData['Server ID'] = String(rec.serverId);
+            orderData['Zone ID'] = String(rec.serverId);
+          }
 
           const moogoldResult = await callMooGoldApi('order/create_order', {
             path: 'order/create_order',
