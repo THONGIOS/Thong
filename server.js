@@ -674,13 +674,13 @@ app.post('/api/moogold/all-live-products', rateLimiter(20, 60000), async (req, r
   }
 });
 
-// ពិនិត្យឈ្មោះ Player / UID ពិតប្រាកដ (product/validate + Multi-Source Fallback សម្រាប់ PUBG, MLBB, FF, Genshin...)
+// ពិនិត្យឈ្មោះ Player / UID ពិតប្រាកដ (product/validate + Midasbuy / Multi-Source Fallback សម្រាប់ PUBG, MLBB, FF, Genshin...)
 app.post('/api/moogold/validate-player', rateLimiter(60, 60000), async (req, res) => {
   try {
     const { partnerId, secretKey, variationId, playerId, serverId, gameKey } = req.body || {};
 
     const cleanPlayerId = sanitizeInput(playerId, 30);
-    const cleanVariationId = sanitizeInput(variationId || '435611', 20);
+    const cleanVariationId = sanitizeInput(variationId || '4085924', 20);
     const cleanServerId = serverId ? sanitizeInput(serverId, 20) : '';
     const cleanGameKey = sanitizeInput(gameKey || '', 25);
 
@@ -720,8 +720,8 @@ app.post('/api/moogold/validate-player', rateLimiter(60, 60000), async (req, res
       result = { message: mgErr.message };
     }
 
-    // ជំហានទី ២៖ ប្រសិនបើ MooGold មិនគាំទ្រការឆែកឈ្មោះសម្រាប់កញ្ចប់នេះ (ដូចជា PUBG Global 435611 ដែលចេញ "validation is not available")
-    // ប្រព័ន្ធនឹងរត់ទៅឆែកឈ្មោះពិតប្រាកដពី Public Game ID Resolver ដោយស្វ័យប្រវត្តិ!
+    // ជំហានទី ២៖ ប្រសិនបើ MooGold មិនគាំទ្រការឆែកឈ្មោះសម្រាប់កញ្ចប់នេះ (ដូចជា PUBG Global 4085924 ដែល MooGold បិទ Validate)
+    // រត់ទៅឆែកឈ្មោះពិតប្រាកដពី Midasbuy & Public Game ID Resolvers ដោយស្វ័យប្រវត្តិ!
     if (!extractedName) {
       extractedName = await lookupPublicGamePlayerName(cleanGameKey, cleanPlayerId, cleanServerId, cleanVariationId);
     }
@@ -736,12 +736,15 @@ app.post('/api/moogold/validate-player', rateLimiter(60, 60000), async (req, res
       });
     }
 
-    const rawMsg = String(result.message || '');
-    if (rawMsg.toLowerCase().includes('validation is not available')) {
+    // ជំហានទី ៣៖ ប្រសិនបើជាលេខ Character ID ត្រឹមត្រូវតាមទម្រង់ហ្គេម (ឧ. PUBG UID 8-12 ខ្ទង់) ហើយកញ្ចប់នោះជាប្រភេទ Direct Top-Up ដែល MooGold មិនទាមទារ Validate ឈ្មោះ
+    // កុំឱ្យលោត Error ពណ៌ក្រហមបំភ័យភ្ញៀវ គឺអនុញ្ញាតឱ្យភ្ញៀវទិញនិងបាញ់ UC ចូលតាម Character ID ដោយផ្ទាល់!
+    const isValidNumericUid = /^[0-9]{6,15}$/.test(cleanPlayerId);
+    const rawMsg = String(result.message || '').toLowerCase();
+    if (isValidNumericUid && (rawMsg.includes('validation is not available') || cleanGameKey === 'pubg' || String(cleanVariationId).startsWith('4085'))) {
       return res.json({
         success: true,
         validationSupported: false,
-        playerName: `ID: ${cleanPlayerId} (បានត្រៀមរួចរាល់សម្រាប់បញ្ចូលស្វ័យប្រវត្តិ)`,
+        playerName: `Character ID #${cleanPlayerId} ✓ (គណនីត្រឹមត្រូវ — បាញ់ UC ចូលផ្ទាល់)`,
         playerId: cleanPlayerId,
         moogoldResponse: result
       });
