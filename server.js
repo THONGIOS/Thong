@@ -309,6 +309,173 @@ function sendError(res, err) {
   });
 }
 
+
+// ====================================================
+// 3.5 MULTI-VENDOR API ENGINES (Smile.One, SEAGM & Night-APIs Midasbuy)
+// ====================================================
+
+// ក. អនុគមន៍ហៅទៅកាន់ Smile.One Reseller API (សម្រាប់ Mobile Legends Brazil/PH/Global តម្លៃដើមថោកបំផុត)
+async function callSmileOneApi(endpointPath, payloadObj, customUid, customEmail, customKey) {
+  const uid = (customUid || process.env.SMILE_ONE_UID || permanentStore.settings?.smileUid || '').trim();
+  const email = (customEmail || process.env.SMILE_ONE_EMAIL || permanentStore.settings?.smileEmail || '').trim();
+  const key = (customKey || process.env.SMILE_ONE_KEY || permanentStore.settings?.smileKey || '').trim();
+
+  if (!uid || !email || !key) {
+    throw new Error('សូមបញ្ចូល SMILE_ONE_UID, SMILE_ONE_EMAIL និង SMILE_ONE_KEY ក្នុងផ្ទាំង Admin ឬ Render Environment ជាមុនសិន!');
+  }
+
+  const time = Math.floor(Date.now() / 1000);
+  const params = {
+    uid,
+    email,
+    time,
+    ...payloadObj
+  };
+
+  // បង្កើតហត្ថលេខាសុវត្ថិភាព Smile.One (Double MD5 Signature sorted by key)
+  const sortedKeys = Object.keys(params).sort();
+  let signStr = '';
+  for (const k of sortedKeys) {
+    signStr += `${k}=${params[k]}&`;
+  }
+  signStr += key;
+
+  const md5First = crypto.createHash('md5').update(signStr).digest('hex');
+  const sign = crypto.createHash('md5').update(md5First).digest('hex');
+  params.sign = sign;
+
+  const formBody = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    formBody.append(k, String(v));
+  }
+
+  const response = await fetch(`https://www.smile.one/smilecoin/api/${endpointPath}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+    },
+    body: formBody.toString(),
+    signal: AbortSignal.timeout(20000)
+  });
+
+  const data = await response.json();
+  if (data.status !== 200 && data.code !== 200) {
+    throw new Error(data.message || `Smile.One API Error: ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+// ខ. អនុគមន៍ហៅទៅកាន់ SEAGM (SEA Gamer Mall) Partner API (សម្រាប់ Gift Cards, Razer Gold & PUBG)
+async function callSeagmApi(endpointPath, payloadObj, customUid, customKey) {
+  const partnerUid = (customUid || process.env.SEAGM_PARTNER_UID || permanentStore.settings?.seagmUid || '').trim();
+  const secretKey = (customKey || process.env.SEAGM_SECRET_KEY || permanentStore.settings?.seagmKey || '').trim();
+
+  if (!partnerUid || !secretKey) {
+    throw new Error('សូមបញ្ចូល SEAGM_PARTNER_UID និង SEAGM_SECRET_KEY ក្នុងផ្ទាំង Admin ឬ Render Environment ជាមុនសិន!');
+  }
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  const fullPayload = {
+    partner_uid: partnerUid,
+    timestamp,
+    ...payloadObj
+  };
+
+  const payloadJson = JSON.stringify(fullPayload);
+  const signature = crypto
+    .createHmac('sha256', secretKey)
+    .update(payloadJson)
+    .digest('hex');
+
+  const response = await fetch(`https://partner.seagm.com/api/v1/${endpointPath}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-SEAGM-Signature': signature
+    },
+    body: payloadJson,
+    signal: AbortSignal.timeout(20000)
+  });
+
+  const data = await response.json();
+  if (!response.ok || data.status === 'error' || data.code && data.code !== 200) {
+    throw new Error(data.message || `SEAGM API Error: ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+// គ. អនុគមន៍កណ្ដាលសម្រាប់បាញ់ទំនិញស្វ័យប្រវត្តិទៅតាមប្រភព API (Smart Multi-Vendor Order Router)
+async function fulfillOrderMultiVendor(orderRecord) {
+  const vendor = String(orderRecord.vendor || 'moogold').toLowerCase().trim();
+  const cleanVarId = String(orderRecord.variationId).replace(/^(smile:|seagm:|moogold:)/i, '').trim();
+
+  // 1. បើជ្រើសរើសប្រភព Smile.One (ឧទាហរណ៍៖ Mobile Legends តម្លៃដើមថោក)
+  if (vendor === 'smileone' || String(orderRecord.variationId).toLowerCase().startsWith('smile:')) {
+    const smileRes = await callSmileOneApi('createorder', {
+      userid: String(orderRecord.playerId),
+      zoneid: String(orderRecord.serverId || '1'),
+      product: 'mobilelegends',
+      productid: cleanVarId
+    });
+    return {
+      vendorUsed: 'Smile.One',
+      rawResponse: smileRes
+    };
+  }
+
+  // 2. បើជ្រើសរើសប្រភព SEAGM (ឧទាហរណ៍៖ Gift Cards / Razer Gold / PUBG)
+  if (vendor === 'seagm' || String(orderRecord.variationId).toLowerCase().startsWith('seagm:')) {
+    const seagmRes = await callSeagmApi('order/create', {
+      product_id: cleanVarId,
+      player_id: String(orderRecord.playerId),
+      server_id: String(orderRecord.serverId || ''),
+      partner_order_id: orderRecord.partnerOrderId
+    });
+    return {
+      vendorUsed: 'SEAGM',
+      rawResponse: seagmRes
+    };
+  }
+
+  // 3. លំនាំដើម៖ បាញ់តាមប្រភព MooGold API ផ្លូវការ
+  const orderData = {
+    category: 1,
+    'product-id': cleanVarId,
+    quantity: 1,
+    'User ID': String(orderRecord.playerId),
+    'Character ID': String(orderRecord.playerId),
+    'Player ID': String(orderRecord.playerId)
+  };
+  if (orderRecord.serverId) {
+    orderData.Server = String(orderRecord.serverId);
+    orderData['Server ID'] = String(orderRecord.serverId);
+    orderData['Zone ID'] = String(orderRecord.serverId);
+  }
+
+  const moogoldPayload = {
+    path: 'order/create_order',
+    data: orderData,
+    partnerOrderId: orderRecord.partnerOrderId
+  };
+
+  const moogoldResult = await callMooGoldApi('order/create_order', moogoldPayload);
+  if (
+    !moogoldResult ||
+    moogoldResult.status === false ||
+    moogoldResult.status === 'false' ||
+    moogoldResult.err_code ||
+    (moogoldResult.message && String(moogoldResult.message).toLowerCase().includes('error'))
+  ) {
+    throw new Error(moogoldResult?.message || JSON.stringify(moogoldResult));
+  }
+
+  return {
+    vendorUsed: 'MooGold',
+    rawResponse: moogoldResult
+  };
+}
+
 // ====================================================
 // 4. ROUTES ទាំងអស់របស់ប្រព័ន្ធ
 // ====================================================
@@ -348,6 +515,9 @@ app.get('/api/store-data', rateLimiter(60, 60000), (req, res) => {
     delete safeSettings.bakongToken;
     delete safeSettings.tgToken;
     delete safeSettings.jsonbinKey;
+    delete safeSettings.smileKey;
+    delete safeSettings.seagmKey;
+    delete safeSettings.nightApiKey;
   }
   res.json({
     success: true,
@@ -382,6 +552,22 @@ app.post('/api/store-data', rateLimiter(30, 60000), async (req, res) => {
       message: '✅ បានរក្សាទុកទិន្នន័យចូលក្នុងម៉ាស៊ីនមេ និង Cloud ជាអចិន្ត្រៃយ៍រួចរាល់!',
       updatedAt: permanentStore.updatedAt
     });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+
+// ឆែកស្ថានភាពតភ្ជាប់ប្រភព API ទាំង ៤ (MooGold, Smile.One, SEAGM, Night-APIs Midasbuy)
+app.post('/api/vendors/status', rateLimiter(20, 60000), async (req, res) => {
+  try {
+    const statusReport = {
+      moogold: { configured: Boolean(process.env.MOOGOLD_PARTNER_ID && process.env.MOOGOLD_SECRET_KEY) },
+      smileone: { configured: Boolean((process.env.SMILE_ONE_UID || permanentStore.settings?.smileUid) && (process.env.SMILE_ONE_KEY || permanentStore.settings?.smileKey)) },
+      seagm: { configured: Boolean((process.env.SEAGM_PARTNER_UID || permanentStore.settings?.seagmUid) && (process.env.SEAGM_SECRET_KEY || permanentStore.settings?.seagmKey)) },
+      nightApiMidasbuy: { configured: Boolean(process.env.NIGHT_API_KEY || permanentStore.settings?.nightApiKey), publicFallbackActive: true }
+    };
+    res.json({ success: true, vendors: statusReport });
   } catch (err) {
     sendError(res, err);
   }
@@ -538,8 +724,30 @@ async function lookupPublicGamePlayerName(gameKey, playerId, serverId, variation
 
   if (!slug) return null;
 
-  // Source 0 (ពិសេសសម្រាប់ PUBG Mobile)៖ Midasbuy getCharacInfo Gateway & MooGold Validate
+  // Source 0 (ពិសេសសម្រាប់ PUBG Mobile)៖ Night-APIs Midasbuy Gateway & Midasbuy Official getCharacInfo
   if (slug === 'pubgm') {
+    const nightApiKey = (process.env.NIGHT_API_KEY || permanentStore.settings?.nightApiKey || '').trim();
+    // ក. សាកល្បងតាមច្រក midasbuy.night-apis.com (ប្រសិនបើមានដាក់ Key ឬបើក Public Endpoint)
+    try {
+      const nightHeaders = { 'Accept': 'application/json' };
+      if (nightApiKey) {
+        nightHeaders['Authorization'] = `Bearer ${nightApiKey}`;
+        nightHeaders['x-api-key'] = nightApiKey;
+      }
+      const nightRes = await fetch(`https://midasbuy.night-apis.com/api/pubg?id=${encodeURIComponent(cleanId)}&apikey=${encodeURIComponent(nightApiKey)}`, {
+        headers: nightHeaders,
+        signal: AbortSignal.timeout(4500)
+      });
+      if (nightRes.ok) {
+        const nightData = await nightRes.json();
+        const nightName = nightData?.name || nightData?.nickname || nightData?.username || nightData?.data?.name || nightData?.data?.nickname || nightData?.charac_name;
+        if (nightName && !isInvalidPlayerNameText(String(nightName))) {
+          return String(nightName).trim();
+        }
+      }
+    } catch (e) {
+      // បន្តទៅច្រក Midasbuy ផ្លូវការ
+    }
     // ក. សាកល្បង Midasbuy Official Character Info Endpoint (បើ Midasbuy មិនជាប់ Captcha លើ IP នេះ)
     try {
       const midasUrl = `https://www.midasbuy.com/interface/getCharacInfo?appid=1450015065&zoneid=1&openid=${encodeURIComponent(cleanId)}&ct=1`;
@@ -799,9 +1007,11 @@ app.post('/api/bakong/create-khqr', rateLimiter(25, 60000), (req, res) => {
     });
 
     // រក្សាទុកព័ត៌មានបញ្ជាទិញក្នុងអង្គចងចាំ (ដើម្បីពេល Bakong បញ្ជាក់ថាបង់លុយរួច វាបាញ់ UC ចូលហ្គេមស្វ័យប្រវត្តិ)
+    const cleanVendor = sanitizeInput(req.body?.vendor || 'moogold', 20);
     khqrOrdersMap.set(md5, {
       md5,
       partnerOrderId,
+      vendor: cleanVendor,
       variationId: cleanVariationId,
       playerId: cleanPlayerId,
       serverId: cleanServerId,
@@ -895,51 +1105,22 @@ app.post('/api/bakong/check-and-fulfill', rateLimiter(60, 60000), async (req, re
       });
     }
 
-    // គ្រាន់តែពិនិត្យឃើញលុយចូល Bakong ភ្លាម បាញ់ Order ទៅ MooGold ភ្លាមៗ!
+    // គ្រាន់តែពិនិត្យឃើញលុយចូល Bakong ភ្លាម បាញ់ Order ទៅកាន់ប្រភព API (MooGold / Smile.One / SEAGM) ភ្លាមៗ!
     orderRecord.status = 'PROCESSING_MOOGOLD';
 
-    const orderData = {
-      category: 1,
-      'product-id': String(orderRecord.variationId),
-      quantity: 1,
-      'User ID': String(orderRecord.playerId),
-      'Character ID': String(orderRecord.playerId),
-      'Player ID': String(orderRecord.playerId)
-    };
-    if (orderRecord.serverId) {
-      orderData.Server = String(orderRecord.serverId);
-      orderData['Server ID'] = String(orderRecord.serverId);
-      orderData['Zone ID'] = String(orderRecord.serverId);
-    }
-
-    const moogoldPayload = {
-      path: 'order/create_order',
-      data: orderData,
-      partnerOrderId: orderRecord.partnerOrderId
-    };
-
     try {
-      const moogoldResult = await callMooGoldApi('order/create_order', moogoldPayload);
-      // ពិនិត្យឱ្យច្បាស់ថាតើ MooGold ពិតជាទទួលយក Order មែនឬអត់ (ការពារករណីលោត COMPLETED ក្លែងក្លាយ)
-      if (
-        !moogoldResult ||
-        moogoldResult.status === false ||
-        moogoldResult.status === 'false' ||
-        moogoldResult.err_code ||
-        (moogoldResult.message && String(moogoldResult.message).toLowerCase().includes('error'))
-      ) {
-        throw new Error(moogoldResult?.message || JSON.stringify(moogoldResult));
-      }
-
+      const multiResult = await fulfillOrderMultiVendor(orderRecord);
       orderRecord.status = 'COMPLETED';
-      orderRecord.moogoldResult = moogoldResult;
+      orderRecord.moogoldResult = multiResult.rawResponse;
+      orderRecord.vendorUsed = multiResult.vendorUsed;
 
       return res.json({
         success: true,
         paid: true,
         fulfilled: true,
+        vendorUsed: multiResult.vendorUsed,
         partnerOrderId: orderRecord.partnerOrderId,
-        moogoldResponse: moogoldResult,
+        moogoldResponse: multiResult.rawResponse,
         bakongData
       });
     } catch (moogoldErr) {
@@ -975,29 +1156,11 @@ app.post('/api/bakong/retry-pending-orders', rateLimiter(20, 60000), async (req,
     for (const [md5Key, rec] of khqrOrdersMap.entries()) {
       if (rec.status === 'PAID_PENDING_MOOGOLD') {
         try {
-          const orderData = {
-            category: 1,
-            'product-id': String(rec.variationId),
-            quantity: 1,
-            'User ID': String(rec.playerId),
-            'Character ID': String(rec.playerId),
-            'Player ID': String(rec.playerId)
-          };
-          if (rec.serverId) {
-            orderData.Server = String(rec.serverId);
-            orderData['Server ID'] = String(rec.serverId);
-            orderData['Zone ID'] = String(rec.serverId);
-          }
-
-          const moogoldResult = await callMooGoldApi('order/create_order', {
-            path: 'order/create_order',
-            data: orderData,
-            partnerOrderId: rec.partnerOrderId
-          });
-
+          const multiResult = await fulfillOrderMultiVendor(rec);
           rec.status = 'COMPLETED';
-          rec.moogoldResult = moogoldResult;
-          retried.push({ partnerOrderId: rec.partnerOrderId, playerId: rec.playerId, status: 'SUCCESS' });
+          rec.moogoldResult = multiResult.rawResponse;
+          rec.vendorUsed = multiResult.vendorUsed;
+          retried.push({ partnerOrderId: rec.partnerOrderId, playerId: rec.playerId, vendorUsed: multiResult.vendorUsed, status: 'SUCCESS' });
         } catch (err) {
           retried.push({ partnerOrderId: rec.partnerOrderId, playerId: rec.playerId, status: 'STILL_FAILED', error: err.message });
         }
